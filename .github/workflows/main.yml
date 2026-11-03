@@ -233,18 +233,7 @@ jobs:
             "$IMAGE_TAG"
 
       - name: Health-check запущенного приложения
-        run: |
-          for i in $(seq 1 15); do
-            if docker exec filemanager-ci python -c \
-              "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read().decode())"; then
-              echo "Приложение отвечает на /health — деплой успешен."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Приложение не поднялось, логи контейнера:"
-          docker logs filemanager-ci
-          exit 1
+        run: sh .github/scripts/healthcheck.sh filemanager-ci 8000
 
       - name: Остановка контейнера
         if: always()
