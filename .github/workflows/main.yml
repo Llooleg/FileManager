@@ -56,6 +56,11 @@ jobs:
       - name: Компиляция исходников (байткод)
         run: python -m compileall -q .
 
+      # В контейнерных джобах рабочая копия принадлежит другому UID,
+      # и git отказывается работать («dubious ownership»). Разрешаем явно.
+      - name: Git safe.directory для контейнера
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Сборка zipapp-артефакта (.pyz)
         run: |
           set -eu
