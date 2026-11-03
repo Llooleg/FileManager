@@ -1,0 +1,18 @@
+# в образ не попадает ничего, кроме кода приложения
+.git
+.github
+.gitignore
+.dockerignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+tests/
+Specs/
+dist/
+reports/
+*.md
+*.db
+workspace/
+.secrets
+filemanager-image.tar.gz

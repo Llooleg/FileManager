@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- CI/CD (локальный запуск через act) ---
+.secrets
+reports/
+*.pyz
+filemanager-image.tar.gz

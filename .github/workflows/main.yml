@@ -1,0 +1,246 @@
+# =============================================================================
+# CI/CD для защищённого файлового менеджера (secfm / FileManager)
+#
+# Явные стадии конвейера (последовательность задаётся через `needs`):
+#   Stage 1 · Build    — компиляция исходников и сборка .pyz ВНУТРИ контейнера
+#   Stage 2 · Test     — unit-тесты + отчёты JUnit XML / Cobertura XML
+#   Stage 3 · Security — SAST (Semgrep); находки High/Critical роняют сборку
+#   Stage 4 · Deploy   — сборка Docker-образа и локальный запуск с пробросом порта
+#
+# Все шаги выполняются в изолированных Docker-контейнерах (`container:`),
+# поэтому результат воспроизводим и не зависит от ОС раннера.
+#
+# Локальный запуск — утилитой act (инструкции в CI-LOCAL.md).
+# Джоба Deploy требует доступа к Docker-сокету хоста (Docker Desktop или
+# self-hosted раннер), поэтому предназначена для ЛОКАЛЬНОГО развертывания.
+#
+# Секреты передаются ТОЛЬКО через переменные окружения (GitHub Secrets при
+# работе с github.com либо файл .secrets при локальном запуске через act)
+# и никогда не хранятся в коде.
+# =============================================================================
+
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 · Build — компиляция исходников внутри контейнера
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Stage 1 · Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: python:3.12 # изоляция всех шагов джобы в контейнере
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Кэш pip-пакетов
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            pip-
+
+      - name: Компиляция исходников (байткод)
+        run: python -m compileall -q .
+
+      - name: Сборка zipapp-артефакта (.pyz)
+        run: |
+          set -eu
+          TAG="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          mkdir -p dist stage/app/FileManager
+          # в артефакт попадает только код приложения из git, без мусора
+          git archive HEAD | tar -x -C stage/app/FileManager
+          rm -rf stage/app/FileManager/tests \
+                 stage/app/FileManager/Specs \
+                 stage/app/FileManager/.github
+          # точка входа архива: абсолютный импорт пакета FileManager
+          printf 'from FileManager.cli import main\nmain()\n' > stage/app/__main__.py
+          python -m zipapp -p "/usr/bin/env python3" \
+            -o "dist/FileManager-${TAG}.pyz" stage/app
+          echo "FileManager-${TAG}.pyz" > dist/latest.txt
+          ls -lh dist
+
+      - name: Загрузка артефакта сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-dist
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 · Test — unit-тесты, отчёты JUnit XML и Cobertura XML
+  # ---------------------------------------------------------------------------
+  test:
+    name: "Stage 2 · Test"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: python:3.12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Кэш pip-пакетов
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            pip-
+
+      - name: Установка тестовых зависимостей
+        run: pip install -r requirements-dev.txt
+
+      # артефакт из Stage 1 передаётся в Stage 2 и проверяется smoke-тестом
+      - name: Загрузка артефакта сборки
+        uses: actions/download-artifact@v4
+        with:
+          name: build-dist
+          path: dist
+
+      - name: Smoke-тест собранного артефакта
+        run: |
+          set -eu
+          PYZ="$(cat dist/latest.txt)"
+          # "3" = пункт меню «Выход»: приложение должно запуститься и корректно завершиться
+          echo "3" | python "dist/${PYZ}" --db /tmp/smoke.db --root /tmp/smoke-ws
+          test -f /tmp/smoke.db
+
+      - name: Unit-тесты (JUnit + Cobertura отчёты)
+        run: |
+          mkdir -p reports
+          python -m pytest -v \
+            --junitxml=reports/junit.xml \
+            --cov=FileManager \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term-missing
+
+      - name: Загрузка отчётов как артефактов
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 · Security (SAST) — Semgrep; High/Critical роняют сборку
+  # ---------------------------------------------------------------------------
+  security:
+    name: "Stage 3 · Security (SAST)"
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: python:3.12
+    env:
+      # Токен передаётся через окружение (GitHub Secrets / .secrets для act),
+      # в репозитории не хранится. Для открытых конфигов не обязателен.
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Кэш pip-пакетов
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}-semgrep
+          restore-keys: |
+            pip-
+
+      - name: Установка Semgrep
+        run: pip install semgrep
+
+      - name: Сканер уязвимостей (Semgrep, p/default)
+        run: |
+          mkdir -p reports
+          semgrep scan --config p/default --metrics=off \
+            --json --output reports/semgrep.json
+
+      - name: Гейт — сборка падает при находках High/Critical
+        run: python .github/scripts/semgrep_gate.py reports/semgrep.json
+
+      - name: Загрузка отчёта SAST как артефакта
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: reports/semgrep.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Stage 4 · Local Deployment — Docker-образ, локальный запуск, проброс порта
+  # Требует Docker-сокет хоста: act (Docker Desktop) или self-hosted раннер.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "Stage 4 · Local Deployment"
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: docker:27-cli
+      options: --volume /var/run/docker.sock:/var/run/docker.sock
+    env:
+      # Секрет приложения: только через окружение, в коде не хранится.
+      APP_SECRET: ${{ secrets.APP_SECRET }}
+    steps:
+      - name: Checkout (нужен git в контейнере)
+        run: apk add --no-cache git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Сборка Docker-образа приложения
+        run: |
+          TAG="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          docker build -t "filemanager:${TAG}" .
+          echo "IMAGE_TAG=filemanager:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Сохранение образа как артефакта конвейера
+        run: docker save "$IMAGE_TAG" | gzip > filemanager-image.tar.gz
+
+      - name: Загрузка Docker-образа как артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: filemanager-image.tar.gz
+          if-no-files-found: error
+
+      - name: Локальный запуск с пробросом порта (8080 -> 8000)
+        run: |
+          docker rm -f filemanager-ci >/dev/null 2>&1 || true
+          docker run -d --name filemanager-ci \
+            -p 8080:8000 \
+            -e APP_SECRET="${APP_SECRET:-local-demo-secret}" \
+            "$IMAGE_TAG"
+
+      - name: Health-check запущенного приложения
+        run: |
+          for i in $(seq 1 15); do
+            if docker exec filemanager-ci python -c \
+              "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read().decode())"; then
+              echo "Приложение отвечает на /health — деплой успешен."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Приложение не поднялось, логи контейнера:"
+          docker logs filemanager-ci
+          exit 1
+
+      - name: Остановка контейнера
+        if: always()
+        run: docker rm -f filemanager-ci || true
